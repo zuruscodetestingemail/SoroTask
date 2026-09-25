@@ -1,4 +1,14 @@
 import { create } from "zustand";
+import {
+  DEFAULT_ALERT_THRESHOLD_HOURS,
+  type VaultSample,
+} from "@/src/lib/gas/vault";
+
+/** How many balance observations to keep before the oldest are dropped. */
+const MAX_VAULT_SAMPLES = 500;
+
+/** Permission states mirrored from the Notification API, without depending on it. */
+export type NotificationPermissionState = "default" | "granted" | "denied" | "unsupported";
 
 export interface GasFeeTier {
   tier: "fast" | "standard" | "safe-low";
@@ -39,10 +49,41 @@ interface GasOptimizationStoreState {
   isSimulating: boolean;
   simulationResult: SimulationResult | null;
 
+  // ──────────────────────────────────────────────────────────────
+  // Gas vault (#1237) — balance runway and low-balance alerting.
+  // The maths lives in @/src/lib/gas/vault; this store only holds
+  // the observations and the notification preferences.
+  // ──────────────────────────────────────────────────────────────
+  /** Current vault balance in XLM. */
+  vaultBalanceXlm: number;
+  /** Balance observations, oldest first. */
+  vaultSamples: VaultSample[];
+  /** Runway threshold in hours below which the keeper is alerted. */
+  alertThresholdHours: number;
+  /** Whether browser notifications are enabled by the user. */
+  notificationsEnabled: boolean;
+  /** Permission state reported by the Notification API. */
+  notificationPermission: NotificationPermissionState;
+  /** Runway at which the last low-balance alert fired, to suppress repeats. */
+  lastAlertedHours: number | null;
+
   // Actions
   refreshMetrics: () => void;
   runSimulation: (contractId: string, method: string) => Promise<void>;
   applyBatching: (opportunityId: string) => void;
+  /** Record a balance observation and derive the new balance. */
+  recordVaultBalance: (balanceXlm: number, timestamp?: number) => void;
+  /** Add XLM to the vault without recording an observation. */
+  topUpVault: (amountXlm: number) => void;
+  /** Drop observations older than `maxAgeMs`, keeping the most recent one. */
+  pruneVaultSamples: (maxAgeMs: number, now?: number) => void;
+  setAlertThresholdHours: (hours: number) => void;
+  setNotificationsEnabled: (enabled: boolean) => void;
+  setNotificationPermission: (permission: NotificationPermissionState) => void;
+  /** Record that an alert fired, so the same runway does not re-notify. */
+  markAlerted: (hoursRemaining: number) => void;
+  /** Clear the alert latch, e.g. after a top-up. */
+  resetAlert: () => void;
 }
 
 const mockTiers: GasFeeTier[] = [
@@ -66,6 +107,78 @@ export const useGasOptimizationStore = create<GasOptimizationStoreState>((set, g
   batchOpportunities: mockBatchOpportunities,
   isSimulating: false,
   simulationResult: null,
+  vaultBalanceXlm: 0,
+  vaultSamples: [],
+  alertThresholdHours: DEFAULT_ALERT_THRESHOLD_HOURS,
+  notificationsEnabled: false,
+  notificationPermission: "default",
+  lastAlertedHours: null,
+
+  recordVaultBalance: (balanceXlm, timestamp) => {
+    // A negative or non-finite reading is a bad RPC response, not a real
+    // balance. Recording it as zero would invent a cliff-edge drop in the
+    // history and poison the burn-rate fit, so the sample is discarded and the
+    // previous observation stands.
+    if (!Number.isFinite(balanceXlm) || balanceXlm < 0) return;
+    const at = timestamp ?? Date.now();
+    set((state) => {
+      const samples = [...state.vaultSamples, { timestamp: at, balanceXlm }];
+      return {
+        vaultBalanceXlm: balanceXlm,
+        // Bound the history: a long-running dashboard would otherwise grow this
+        // array without limit and slow every downstream burn-rate fit.
+        vaultSamples: samples.slice(-MAX_VAULT_SAMPLES),
+      };
+    });
+  },
+
+  topUpVault: (amountXlm) => {
+    const amount = Number.isFinite(amountXlm) && amountXlm > 0 ? amountXlm : 0;
+    if (amount === 0) return;
+    set((state) => {
+      const balance = state.vaultBalanceXlm + amount;
+      const samples = [...state.vaultSamples, { timestamp: Date.now(), balanceXlm: balance }];
+      return {
+        vaultBalanceXlm: balance,
+        vaultSamples: samples.slice(-MAX_VAULT_SAMPLES),
+        // A top-up is the resolution to a low-balance alert, so clear the latch
+        // rather than leaving it to suppress the next genuine warning.
+        lastAlertedHours: null,
+      };
+    });
+  },
+
+  pruneVaultSamples: (maxAgeMs, now) => {
+    const at = now ?? Date.now();
+    const cutoff = at - maxAgeMs;
+    set((state) => {
+      const kept = state.vaultSamples.filter((s) => s.timestamp >= cutoff);
+      // Never prune away the current balance: with a single stale sample the
+      // burn-rate fit reports "not burning", which would read as good news.
+      if (kept.length === state.vaultSamples.length) return state;
+      const latest = state.vaultSamples[state.vaultSamples.length - 1];
+      if (latest && (kept.length === 0 || kept[kept.length - 1] !== latest)) {
+        kept.push(latest);
+      }
+      return { vaultSamples: kept };
+    });
+  },
+
+  setAlertThresholdHours: (hours) => {
+    if (!Number.isFinite(hours) || hours <= 0) return;
+    set({ alertThresholdHours: hours, lastAlertedHours: null });
+  },
+
+  setNotificationsEnabled: (enabled) => set({ notificationsEnabled: enabled }),
+
+  setNotificationPermission: (permission) => set({ notificationPermission: permission }),
+
+  markAlerted: (hoursRemaining) => {
+    if (!Number.isFinite(hoursRemaining) || hoursRemaining < 0) return;
+    set({ lastAlertedHours: hoursRemaining });
+  },
+
+  resetAlert: () => set({ lastAlertedHours: null }),
 
   refreshMetrics: () => {
     // Simulate real-time fluctuated fee updates
